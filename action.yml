@@ -2,7 +2,7 @@ name: 'MadX Leakguard'
 description: 'Fail CI when a commit leaks a LAN machine identity, internal hostname, private IP, home path, or secret into a public repo.'
 branding:
   icon: 'shield'
-  color: 'orange'
+  color: 'red'
 runs:
   using: composite
   steps:
