@@ -20,10 +20,13 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # resolve sibling map_render
 
 # ---------------- shared detection ----------------
-LAN_HOST = re.compile(r"\b[a-zA-Z0-9][a-zA-Z0-9-]{0,40}\.(local|lan|home|internal|home\.arpa)\b", re.I)
+# leaf-anchored: matches nas.local / user@umbrel.local, NOT mail.internal.bigcorp.com
+LAN_HOST = re.compile(r"\b[a-zA-Z0-9][a-zA-Z0-9-]{0,40}\.(?:local|lan|home|internal|home\.arpa)(?![a-zA-Z0-9.-])", re.I)
 RFC1918  = re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
 HOMEPATH = re.compile(r"/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|[Cc]:\\Users\\[^\\\s]+")
 SECRET   = re.compile(r"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|xox[baprs]-[A-Za-z0-9-]{10}|AIza[0-9A-Za-z_-]{35}|-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")
+# well-known public defaults that are not real leaks (Docker/K8s/CI containers, loopback)
+BENIGN   = re.compile(r"host\.docker\.internal|docker\.internal|/home/(?:node|runner|vscode|appuser|coder|nonroot)/|(?<![\d.])127\.0\.0\.1(?![\d.])|172\.17\.\d{1,3}\.\d{1,3}|10\.244\.\d{1,3}\.\d{1,3}|10\.96\.\d{1,3}\.\d{1,3}|192\.168\.99\.\d{1,3}", re.I)
 COAUTHOR = re.compile(r"(?im)^\s*co-authored-by:\s*(.*?)\s*<([^>]+)>")
 TZ       = re.compile(r"([+-]\d{2}:?\d{2})$")
 HOUR     = re.compile(r"T(\d{2}):")
@@ -48,6 +51,11 @@ def sh(*args):
 def git(*args):
     return sh("git", *args).stdout.strip()
 
+def git_out(*args):
+    """Return (ok, stdout). ok is False when git exits non-zero (e.g. an unresolved ref)."""
+    r = sh("git", *args)
+    return (r.returncode == 0, r.stdout)
+
 def machine_host(email):
     if not email or "@" not in email:
         return None
@@ -65,7 +73,16 @@ def is_lan_identity(email):
     return host == (os.uname().nodename if hasattr(os, "uname") else "")
 
 def scan_added_lines(diff, label, pat):
-    hits = [ln for ln in diff.splitlines() if ln.startswith("+") and pat.search(ln)][:5]
+    hits = []
+    for ln in diff.splitlines():
+        if not ln.startswith("+") or ln.startswith("+++"):
+            continue  # only real added content, never the +++ file-header line
+        if "leakguard:allow" in ln:
+            continue  # inline suppression escape hatch
+        if pat.search(BENIGN.sub("", ln)):  # ignore well-known public defaults
+            hits.append(ln)
+            if len(hits) >= 5:
+                break
     if hits:
         print(red(f"FOUND ({label}):"))
         for h in hits: print("    " + h[:160])
@@ -106,15 +123,29 @@ def cmd_hook(_):
 
 def cmd_ci(a):
     base = a.base or os.environ.get("GITHUB_BASE_REF") or ""
-    rng = f"origin/{base}...HEAD" if base else "HEAD~1...HEAD"
-    diff = git("diff", rng) or git("show", "HEAD")
+    if base:
+        # PR: diff base..HEAD. Try origin/<base> then a local <base> ref.
+        ok, diff = git_out("diff", f"origin/{base}...HEAD")
+        rng = f"origin/{base}...HEAD"
+        if not ok:
+            ok, diff = git_out("diff", f"{base}...HEAD"); rng = f"{base}...HEAD"
+        if not ok:
+            # fail CLOSED: never report clean when we could not compute the range
+            print(red(f"leakguard CI ERROR: cannot resolve base ref '{base}'."))
+            print(ylw("  Check out with fetch-depth: 0 so the base branch is available:"))
+            print("    - uses: actions/checkout@v4\n      with: { fetch-depth: 0 }")
+            return 2
+        _, ids_out = git_out("log", "--format=%ae%n%ce", rng)
+    else:
+        # push / no base: scan the tip commit only
+        ok, diff = git_out("show", "HEAD")
+        _, ids_out = git_out("log", "-1", "--format=%ae%n%ce")
     fail = False
     for label, pat in (("internal hostname", LAN_HOST), ("private/LAN IP", RFC1918),
                        ("home directory path", HOMEPATH), ("possible secret", SECRET)):
         if scan_added_lines(diff, label, pat): fail = True
-    ids = git("log", "--format=%ae%n%ce", rng).splitlines()
-    for e in set(ids):
-        if is_lan_identity(e):
+    for e in set((ids_out or "").splitlines()):
+        if e and is_lan_identity(e):
             print(red(f"FOUND (LAN commit identity in range): {e}")); fail = True
     print((red("leakguard CI: leaks found") if fail else grn("leakguard CI: clean")))
     return 1 if fail else 0

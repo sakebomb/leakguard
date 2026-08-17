@@ -8,4 +8,6 @@ runs:
   steps:
     - name: leakguard scan
       shell: bash
-      run: python3 "$GITHUB_ACTION_PATH/leakguard.py" ci --base "${{ github.base_ref }}"
+      env:
+        BASE_REF: ${{ github.base_ref }}   # via env, not inline, to avoid script injection
+      run: python3 "$GITHUB_ACTION_PATH/leakguard.py" ci --base "$BASE_REF"
