@@ -1,0 +1,10 @@
+# Copy this to .github/workflows/leakguard.yml in your repo to block leaky commits on every PR.
+name: leakguard
+on: [pull_request]
+jobs:
+  leakguard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # needed so leakguard can diff base..HEAD
+      - uses: sakebomb/leakguard@v1

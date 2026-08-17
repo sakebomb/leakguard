@@ -1,0 +1,11 @@
+name: 'leakguard'
+description: 'Fail CI when a commit leaks a LAN machine identity, internal hostname, private IP, home path, or secret into a public repo.'
+branding:
+  icon: 'shield'
+  color: 'orange'
+runs:
+  using: composite
+  steps:
+    - name: leakguard scan
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/leakguard.py" ci --base "${{ github.base_ref }}"
