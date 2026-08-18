@@ -1,4 +1,7 @@
-# Copy this to .github/workflows/leakguard.yml in your repo to block leaky commits on every PR.
+# Users: copy this to .github/workflows/leakguard.yml in your repo and replace
+# `uses: ./` with `uses: sakebomb/leakguard@v1` to block leaky commits on every PR.
+# This repo itself dogfoods `./` so the self-scan tests the current code, not a
+# stale published tag (otherwise the repo could never land a detection improvement).
 name: leakguard
 on: [pull_request]
 jobs:
@@ -7,4 +10,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }   # needed so leakguard can diff base..HEAD
-      - uses: sakebomb/leakguard@v1
+      - uses: ./
