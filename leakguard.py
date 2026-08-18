@@ -22,12 +22,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # resolve siblin
 # ---------------- shared detection ----------------
 # leaf-anchored: matches nas.local / user@umbrel.local, NOT mail.internal.bigcorp.com
 LAN_HOST = re.compile(r"\b[a-zA-Z0-9][a-zA-Z0-9-]{0,40}\.(?:local|lan|home|internal|home\.arpa)(?![a-zA-Z0-9.-])", re.I)
+TSNET    = re.compile(r"\b[a-z0-9][a-z0-9-]{0,60}\.ts\.net\b", re.I)  # Tailscale MagicDNS: leaks the tailnet name
 RFC1918  = re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
 HOMEPATH = re.compile(r"/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|[Cc]:\\Users\\[^\\\s]+")
 SECRET   = re.compile(r"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|xox[baprs]-[A-Za-z0-9-]{10}|AIza[0-9A-Za-z_-]{35}|-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")
-# well-known public defaults that are not real leaks (Docker/K8s/CI containers, loopback)
-BENIGN   = re.compile(r"host\.docker\.internal|docker\.internal|/home/(?:node|runner|vscode|appuser|coder|nonroot)/|(?<![\d.])127\.0\.0\.1(?![\d.])|172\.17\.\d{1,3}\.\d{1,3}|10\.244\.\d{1,3}\.\d{1,3}|10\.96\.\d{1,3}\.\d{1,3}|192\.168\.99\.\d{1,3}", re.I)
+# well-known public defaults that are not real leaks (Docker/K8s/CI containers, loopback).
+# `cluster.local` is the default Kubernetes DNS suffix (boilerplate, never a personal machine).
+BENIGN   = re.compile(r"host\.docker\.internal|docker\.internal|cluster\.local|/home/(?:node|runner|vscode|appuser|coder|nonroot)/|(?<![\d.])127\.0\.0\.1(?![\d.])|172\.17\.\d{1,3}\.\d{1,3}|10\.244\.\d{1,3}\.\d{1,3}|10\.96\.\d{1,3}\.\d{1,3}|192\.168\.99\.\d{1,3}", re.I)
 COAUTHOR = re.compile(r"(?im)^\s*co-authored-by:\s*(.*?)\s*<([^>]+)>")
+# git-log identity format: author + committer + every Co-authored-by trailer (one line each)
+LOG_IDS_FMT = "%ae%n%ce%n%(trailers:key=Co-authored-by,valueonly)"
 TZ       = re.compile(r"([+-]\d{2}:?\d{2})$")
 HOUR     = re.compile(r"T(\d{2}):")
 MODEL    = re.compile(r"(Claude\s+(?:Sonnet|Opus|Haiku)\s+[0-9][0-9.]*)", re.I)
@@ -106,6 +110,9 @@ def gh(args, accept=None):
 def cmd_hook(_):
     if os.environ.get("LEAKGUARD_ALLOW") == "1":
         print(ylw("leakguard: bypassed via LEAKGUARD_ALLOW=1")); return 0
+    if not git_out("rev-parse", "--git-dir")[0]:
+        # git broken/missing or not a repo: fail CLOSED, never wave a commit through blind
+        print(red("leakguard: not a git repository (or git unavailable) - failing closed")); return 1
     fail = False
     email = git("config", "user.email")
     if is_lan_identity(email):
@@ -113,8 +120,9 @@ def cmd_hook(_):
         print("  -> run: leakguard harden   (or: git config user.email you@users.noreply.github.com)")
         fail = True
     diff = git("diff", "--cached")
-    for label, pat in (("internal hostname", LAN_HOST), ("private/LAN IP", RFC1918),
-                       ("home directory path", HOMEPATH), ("possible secret", SECRET)):
+    for label, pat in (("internal hostname", LAN_HOST), ("tailscale tailnet name", TSNET),
+                       ("private/LAN IP", RFC1918), ("home directory path", HOMEPATH),
+                       ("possible secret", SECRET)):
         if scan_added_lines(diff, label, pat): fail = True
     if fail:
         print(ylw("\nBlocked by leakguard. Fix it, or bypass once: LEAKGUARD_ALLOW=1 git commit ..."))
@@ -135,14 +143,20 @@ def cmd_ci(a):
             print(ylw("  Check out with fetch-depth: 0 so the base branch is available:"))
             print("    - uses: actions/checkout@v4\n      with: { fetch-depth: 0 }")
             return 2
-        _, ids_out = git_out("log", "--format=%ae%n%ce", rng)
+        # include co-author trailers: the dominant leak vector rides there, not in %ae/%ce
+        _, ids_out = git_out("log", f"--format={LOG_IDS_FMT}", rng)
     else:
         # push / no base: scan the tip commit only
         ok, diff = git_out("show", "HEAD")
-        _, ids_out = git_out("log", "-1", "--format=%ae%n%ce")
+        if not ok:
+            # fail CLOSED: empty/unborn/detached HEAD or non-repo must not report "clean"
+            print(red("leakguard CI ERROR: cannot read HEAD (empty repo, unborn/detached HEAD, or not a git repository)."))
+            return 2
+        _, ids_out = git_out("log", "-1", f"--format={LOG_IDS_FMT}")
     fail = False
-    for label, pat in (("internal hostname", LAN_HOST), ("private/LAN IP", RFC1918),
-                       ("home directory path", HOMEPATH), ("possible secret", SECRET)):
+    for label, pat in (("internal hostname", LAN_HOST), ("tailscale tailnet name", TSNET),
+                       ("private/LAN IP", RFC1918), ("home directory path", HOMEPATH),
+                       ("possible secret", SECRET)):
         if scan_added_lines(diff, label, pat): fail = True
     for e in set((ids_out or "").splitlines()):
         if e and is_lan_identity(e):
