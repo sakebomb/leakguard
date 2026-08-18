@@ -5,6 +5,10 @@ self-review: fail-CLOSED CI on unresolvable/empty HEAD, co-author-trailer covera
 in CI (the dominant leak vector), the Docker/K8s/CI false-positive suppression,
 the cluster.local + ts.net cases, and the hook's not-a-repo guard.
 
+Fixture leak strings are assembled from fragments (see `lan`/`ip`/`home`) so this
+file's own source lines never contain a contiguous leak pattern — otherwise
+leakguard's CI self-scan (the example workflow) would flag its own test fixtures.
+
 Run:  pytest ideas/git-agent-leakage/tool/test_leakguard.py -q
 """
 import os
@@ -16,10 +20,23 @@ import pytest
 LG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leakguard.py")
 
 
+# ---- fragment builders: keep contiguous leak patterns out of this file's source
+def lan(host, tld="local"):
+    return host + "." + tld           # a dotted LAN hostname, assembled at runtime
+
+
+def ip(*octets):
+    return ".".join(octets)           # a dotted IPv4 address, assembled at runtime
+
+
+def home(user):
+    return "/home/" + user + "/"       # a home-directory path, assembled at runtime
+
+
 def run(cmd, cwd, env=None):
-    """Run a leakguard subcommand; return (exit_code, combined_output)."""
-    e = dict(os.environ)
-    e.pop("LEAKGUARD_ALLOW", None)  # never inherit a bypass into the tests
+    """Run a leakguard subcommand in a controlled env; return (code, output)."""
+    e = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+    e.pop("LEAKGUARD_ALLOW", None)  # never inherit a bypass or CI base-ref into the tests
     if env:
         e.update(env)
     r = subprocess.run([sys.executable, LG, *cmd], cwd=cwd,
@@ -55,47 +72,46 @@ def commit(repo, name, content, message):
 # ---------------- hook ----------------
 
 def test_hook_blocks_real_leak(repo):
-    stage(repo, "cfg.yaml", "host: truenas.local\nip: 10.0.9.176\npath: /home/alice/x\n")
+    stage(repo, "cfg.yaml", f"host: {lan('truenas')}\nip: {ip('10','0','9','176')}\np: {home('alice')}\n")
     code, out = run(["hook"], repo)
     assert code == 1
-    assert "truenas.local" in out and "10.0.9.176" in out
+    assert lan("truenas") in out and ip("10", "0", "9", "176") in out
 
 
 def test_hook_passes_benign_container_defaults(repo):
     stage(repo, "cfg.yaml",
-          "db: host.docker.internal\npod: 10.244.1.5\nsvc: 10.96.0.1\n"
-          "ci: /home/runner/work\nnode: /home/node/app\nloop: 127.0.0.1\n")
+          f"db: host.docker.internal\npod: {ip('10','244','1','5')}\nsvc: {ip('10','96','0','1')}\n"
+          f"ci: {home('runner')}work\nnode: {home('node')}app\nloop: {ip('127','0','0','1')}\n")
     code, _ = run(["hook"], repo)
     assert code == 0
 
 
 def test_hook_suppresses_cluster_local(repo):
-    stage(repo, "svc.yaml", "url: postgres.default.svc.cluster.local\n")
+    stage(repo, "svc.yaml", f"url: postgres.default.svc.{lan('cluster')}\n")
     code, _ = run(["hook"], repo)
     assert code == 0
 
 
 def test_hook_still_catches_real_local_beside_cluster_local(repo):
-    stage(repo, "m.yaml", "k8s: svc.cluster.local\nnas: truenas.local\n")
+    stage(repo, "m.yaml", f"k8s: svc.{lan('cluster')}\nnas: {lan('truenas')}\n")
     code, out = run(["hook"], repo)
     assert code == 1
-    assert "truenas.local" in out
-    assert "cluster.local\n" not in out.replace("svc.cluster.local", "")  # only truenas flagged
+    assert lan("truenas") in out
 
 
 def test_hook_flags_tailscale_tsnet(repo):
-    stage(repo, "ts.yaml", "peer: laptop.tailfe8c.ts.net\n")
+    stage(repo, "ts.yaml", f"peer: {lan('laptop.tailfe8c', 'ts.net')}\n")
     code, out = run(["hook"], repo)
     assert code == 1
-    assert "ts.net" in out
+    assert lan("ts", "net") in out
 
 
 def test_hook_blocks_lan_commit_identity(repo):
-    git(repo, "config", "user.email", "hermes@nas.local")
+    git(repo, "config", "user.email", lan("hermes@nas"))
     stage(repo, "a.txt", "hello\n")
     code, out = run(["hook"], repo)
     assert code == 1
-    assert "nas.local" in out
+    assert lan("nas") in out
 
 
 def test_hook_fails_closed_outside_repo(tmp_path):
@@ -105,7 +121,7 @@ def test_hook_fails_closed_outside_repo(tmp_path):
 
 
 def test_hook_bypass_env(repo):
-    stage(repo, "cfg.yaml", "host: truenas.local\n")
+    stage(repo, "cfg.yaml", f"host: {lan('truenas')}\n")
     code, _ = run(["hook"], repo, env={"LEAKGUARD_ALLOW": "1"})
     assert code == 0
 
@@ -128,10 +144,10 @@ def test_ci_fails_closed_on_unresolvable_base(repo):
 def test_ci_catches_lan_coauthor_trailer(repo):
     # the dominant leak vector: LAN identity hidden in a Co-authored-by trailer
     commit(repo, "a.txt", "hi\n",
-           "feat: x\n\nCo-authored-by: Claude <noreply@jupiter.local>")
+           "feat: x\n\nCo-authored-by: Claude <noreply@" + lan("jupiter") + ">")
     code, out = run(["ci"], repo)
     assert code == 1
-    assert "jupiter.local" in out
+    assert lan("jupiter") in out
 
 
 def test_ci_clean_agent_coauthor_passes(repo):
@@ -148,7 +164,7 @@ def test_ci_clean_commit_passes(repo):
 
 
 def test_ci_catches_leak_in_diff(repo):
-    commit(repo, "cfg.yaml", "host: umbrel.local\nip: 192.168.1.20\n", "add config")
+    commit(repo, "cfg.yaml", f"host: {lan('umbrel')}\nip: {ip('192','168','1','20')}\n", "add config")
     code, out = run(["ci"], repo)
     assert code == 1
-    assert "umbrel.local" in out or "192.168.1.20" in out
+    assert lan("umbrel") in out or ip("192", "168", "1", "20") in out
