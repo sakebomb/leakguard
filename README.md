@@ -70,7 +70,7 @@ If you use [pre-commit](https://pre-commit.com), add to `.pre-commit-config.yaml
 ```yaml
 repos:
   - repo: https://github.com/sakebomb/leakguard
-    rev: v1.1.0
+    rev: v1.1.1
     hooks:
       - id: leakguard              # scans the staged diff
       - id: leakguard-commit-msg   # optional: scans the commit message
