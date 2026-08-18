@@ -294,10 +294,95 @@ def test_mask_never_returns_full_value():
     assert raw not in detectors.mask(raw)
 
 
+def test_mask_caps_disclosure_on_short_secrets():
+    # a short 9-20 char secret must not leak more than ~1/3 of its characters
+    # (regression guard for the old first-4+last-2 rule that showed 6-of-9 = 67%).
+    for n in (9, 12, 16, 20):
+        v = "".join(chr(ord("a") + (i % 26)) for i in range(n))
+        m = detectors.mask(v)
+        revealed = sum(1 for c in m if c != "*")
+        assert revealed <= max(3, n // 4), f"mask leaked {revealed}/{n} chars: {m!r}"
+        assert v not in m
+
+
 def test_scan_secret_line_keyword_prefilter_is_case_insensitive():
     # a real value with an uppercased prefix context still resolves the token
     hits = detectors.scan_secret_line("KEY=" + tok("ghp_", "c", 36))
     assert any(rid == "github-pat" for rid, _ in hits)
+
+
+# ---- positive detection samples: one BLOCK-tier rule per entry ----
+# Every value is assembled at runtime from fragments so this file's own source never
+# contains a contiguous provider-token literal (an external scanner run over this repo
+# would otherwise flag the test fixtures themselves). Each `line` embeds the value plus,
+# where the rule uses a keyword pre-filter that the token prefix doesn't already supply
+# (discord/twilio/mailgun/telegram), the provider keyword in context.
+def _block_samples():
+    return [
+        ("aws-access-key", "aws_key=" + tok("AKIA", "A", 16)),
+        ("github-pat", "token=" + tok("ghp_", "a", 36)),
+        ("github-oauth", "token=" + tok("gho_", "b", 36)),
+        ("github-fine-grained-pat", "token=" + tok("github_pat_", "c", 82)),
+        ("gitlab-pat", "token=" + tok("glpat-", "d", 20)),
+        ("gitlab-pat-routable", "token=" + tok("glpat-", "e", 27) + "." + tok("ab", "1", 7)),
+        ("npm-access-token", "token=" + tok("npm_", "f", 36)),
+        ("pypi-upload-token", "token=" + tok("pypi-AgEIcHlwaS5vcmc", "g", 50)),
+        ("stripe-secret-key", "key=" + tok("sk_live_", "h", 24)),
+        ("sendgrid-api-key", "key=" + tok("SG.", "i", 22) + "." + tok("", "j", 43)),
+        ("openai-api-key", "key=" + tok("sk-proj-", "k", 20, "T3BlbkFJ") + tok("", "l", 20)),
+        ("anthropic-api-key", "key=" + tok("sk-ant-api03-", "m", 95)),
+        ("slack-bot-token", "token=" + tok("xoxb-", "n", 20)),
+        ("slack-webhook-url",
+         "url=https://hooks.slack.com/services/T" + "A" * 8 + "/B" + "A" * 8 + "/" + "o" * 20),
+        ("google-api-key", "key=" + tok("AIza", "p", 35)),
+        ("google-oauth-client-secret", "secret=" + tok("GOCSPX-", "q", 28)),
+        ("digitalocean-token", "token=" + tok("dop_v1_", "a", 64)),
+        ("discord-bot-token",
+         "discord bot token=" + "M" + "r" * 24 + "." + "s" * 6 + "." + "t" * 30),
+        ("twilio-api-key", "twilio api key=" + tok("SK", "a", 32)),
+        ("mailgun-private-key", "mailgun key=" + tok("key-", "a", 32)),
+        ("telegram-bot-token", "telegram bot=" + "12345678" + ":" + "u" * 35),
+        ("private-key", "-----BEGIN PRIVATE KEY-----"),
+        ("connection-string-creds", "db=" + conn("postgres", "dbuser", "s3cretpassw0rd", "db.host")),
+    ]
+
+
+def test_every_block_rule_has_a_positive_sample():
+    """A new BLOCK rule with no positive sample is a coverage hole — force one.
+
+    This is the guard that keeps the 17-rules-untested regression from reopening:
+    it fails the moment SECRET_RULES gains a rule that _block_samples() doesn't cover.
+    """
+    covered = {rid for rid, _ in _block_samples()}
+    all_ids = {r.id for r in detectors.SECRET_RULES}
+    assert all_ids <= covered, f"BLOCK rules with no positive detection sample: {sorted(all_ids - covered)}"
+
+
+@pytest.mark.parametrize("rule_id,line", _block_samples(), ids=[s[0] for s in _block_samples()])
+def test_block_rule_fires_on_its_sample(rule_id, line):
+    """Each BLOCK rule must actually detect a valid sample of its own token.
+
+    Mutation-checked: deleting a rule's regex turns exactly this rule's case red.
+    """
+    ids = [rid for rid, _ in detectors.scan_secret_line(line)]
+    assert rule_id in ids, f"{rule_id} did not fire on its sample; got {ids}"
+
+
+def test_sensitive_file_config_credentials_scoped_to_known_dirs():
+    """The dir-scoping guard: bare `config`/`credentials` must NOT block (removing the
+    guard would flag nearly every commit touching a file named `config`)."""
+    assert detectors.sensitive_file("src/config") is None
+    assert detectors.sensitive_file("app/credentials") is None
+    assert detectors.sensitive_file(".kube/config") is not None
+    assert detectors.sensitive_file(".aws/credentials") is not None
+
+
+def test_scan_secret_line_inline_allow_marker_suppresses_then_fires_without():
+    """The documented `leakguard:allow` false-positive escape hatch must work — and
+    must NOT swallow the same line once the marker is removed."""
+    real = "token=" + tok("ghp_", "a", 36)
+    assert detectors.scan_secret_line(real + "  # leakguard:allow") == []
+    assert any(rid == "github-pat" for rid, _ in detectors.scan_secret_line(real))
 
 
 # ---------------- Phase 2: entropy / generic heuristics (audit-only, WARN) ----------------

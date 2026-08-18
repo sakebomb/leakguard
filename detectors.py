@@ -139,11 +139,22 @@ _ENV_ALLOW = re.compile(r"\.env\.(example|sample|template|dist|local\.example)$"
 
 
 def mask(value):
-    """Redact a matched secret for safe logging: first 4 + last 2, middle starred."""
+    """Redact a matched secret for safe logging: reveal at most ~1/4 of the value.
+
+    Enough of a hint to recognize which secret (prefix + a trailing char), but a
+    short 9-20 char password no longer leaks 50-67% of itself. Prefix caps at 4,
+    suffix at 2, and the revealed total never exceeds a quarter of the length, so
+    the middle always keeps a solid run of stars regardless of length.
+    """
     v = value.strip()
+    if not v:
+        return ""
     if len(v) <= 8:
-        return v[0] + "*" * (len(v) - 1) if v else ""
-    return f"{v[:4]}{'*' * min(len(v) - 6, 12)}{v[-2:]}"
+        return v[0] + "*" * (len(v) - 1)
+    show = max(3, len(v) // 4)          # total revealed chars, floor of 3
+    pre = min(4, show - 1)              # leading hint, capped at 4
+    suf = min(2, show - pre)            # trailing hint, capped at 2
+    return f"{v[:pre]}{'*' * (len(v) - pre - suf)}{v[-suf:]}"
 
 
 def fingerprint(kind, value):
