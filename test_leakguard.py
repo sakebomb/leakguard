@@ -344,6 +344,13 @@ def _block_samples():
         ("telegram-bot-token", "telegram bot=" + "12345678" + ":" + "u" * 35),
         ("private-key", "-----BEGIN PRIVATE KEY-----"),
         ("connection-string-creds", "db=" + conn("postgres", "dbuser", "s3cretpassw0rd", "db.host")),
+        # homelab / self-hosted infra rules
+        ("wireguard-key", "PrivateKey = " + tok("", "A", 43, "=")),
+        ("tailscale-auth-key", "TS=" + tok("tskey-auth-k", "A", 10, "-") + tok("", "B", 20)),
+        ("age-secret-key", "key=" + tok("AGE-SECRET-KEY-1", "Q", 58)),
+        ("truenas-api-key", "truenas token=1-" + tok("", "a", 64)),
+        ("grafana-service-account-token",
+         "grafana token=" + tok("glsa_", "a", 32) + "_" + tok("", "0", 8)),
     ]
 
 
@@ -375,6 +382,42 @@ def test_sensitive_file_config_credentials_scoped_to_known_dirs():
     assert detectors.sensitive_file("app/credentials") is None
     assert detectors.sensitive_file(".kube/config") is not None
     assert detectors.sensitive_file(".aws/credentials") is not None
+
+
+def test_new_credential_and_client_config_globs_block():
+    """Absorbed sensitive-filename catalog (github-dorks/keyhacks) + DB/FTP client
+    configs that leak internal DB/host IPs. Each is a hard BLOCK."""
+    for name in (".pgpass", ".s3cfg", ".dockercfg", "_netrc", "master.key",
+                 "prod.secret.exs", "app.ppk", "logins.json",
+                 "filezilla.xml", "recentservers.xml", "robomongo.json",
+                 "sftp-config.json", ".ftpconfig", ".remote-sync.json",
+                 ".bash_history", ".zsh_history",
+                 "github-recovery-codes.txt", "discord_backup_codes.txt"):
+        assert detectors.sensitive_file("some/dir/" + name) is not None, name
+
+
+def test_shadow_scoped_to_etc():
+    """etc/shadow (Unix password db) blocks; a bare `shadow` (shader/asset) must not."""
+    assert detectors.sensitive_file("etc/shadow") is not None
+    assert detectors.sensitive_file("game/assets/shadow") is None
+
+
+def test_topology_config_files_warn_not_block():
+    """Infra configs that disclose topology but carry no credential themselves are
+    WARN-surfaced, not a hard BLOCK (avoids false positives on legit committed configs)."""
+    for name in ("sshd_config", "dhcpd.conf", "wp-config.php", "dbeaver-data-sources.xml"):
+        assert detectors.sensitive_file("etc/" + name) is None
+        assert detectors.warn_file("etc/" + name) is not None
+
+
+def test_entropy_filters_sequential_walks_but_keeps_random():
+    """Sequential/counting walks that break a pure arithmetic run used to slip through
+    the entropy heuristic as false positives; the sequential-fraction filter drops them
+    while a genuinely random high-entropy string still fires."""
+    assert detectors.scan_entropy_line('"' + "abcdefghijklmnopqrstuvwxyz0" + '"') == []
+    assert detectors.scan_entropy_line('"' + "0123456789012345678901234" + '"') == []
+    # control: a real random-looking secret must NOT be suppressed
+    assert detectors.scan_entropy_line('"aB3xK9zQ2mL7pW1sV5tY8uR4nH"') != []
 
 
 def test_scan_secret_line_inline_allow_marker_suppresses_then_fires_without():
