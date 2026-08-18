@@ -1,0 +1,25 @@
+# leakguard hooks for the pre-commit framework (https://pre-commit.com).
+# Consumers add this to their .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/sakebomb/leakguard
+#       rev: v1.1.0
+#       hooks:
+#         - id: leakguard
+#         - id: leakguard-commit-msg   # optional: also scan commit messages
+#
+# language: script runs leakguard.py directly (stdlib only, no install step). The gate
+# scans the staged diff itself, so filenames are not passed to it.
+- id: leakguard
+  name: leakguard (identity + secret leak gate)
+  description: Block LAN identity, internal topology, secrets, and sensitive files from entering git history.
+  entry: leakguard.py hook
+  language: script
+  pass_filenames: false
+  stages: [pre-commit]
+- id: leakguard-commit-msg
+  name: leakguard commit-message scan
+  description: Block secrets or machine identity pasted into the commit message body.
+  entry: leakguard.py commit-msg
+  language: script
+  stages: [commit-msg]
