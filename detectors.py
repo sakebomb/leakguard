@@ -83,6 +83,30 @@ SECRET_RULES = [
     # caught. Capture group 1 is the password so the placeholder denylist can vet it.
     _rule("connection-string-creds", ["://"],
           r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:([^/\s:@]{3,})@[^\s/]+"),
+    # ---- homelab / self-hosted infra (the de-anonymization + topology moat) ----
+    # WireGuard key material. A .conf carries these next to the internal peer IPs
+    # (10.x/32) the topology scanner already flags - a secret+topology twofer.
+    # 44-char base64 (32 bytes). PublicKey is not secret, so only Private/Preshared.
+    _rule("wireguard-key", ["privatekey", "presharedkey"],
+          r"(?:PrivateKey|PresharedKey)\s*=\s*([A-Za-z0-9+/]{43}=)"),
+    # Tailscale auth/API keys - the credential companion to the *.ts.net hostnames the
+    # topology scanner already fingerprints. Fixed tskey-<kind>- prefix keeps it precise.
+    _rule("tailscale-auth-key", ["tskey-"],
+          r"\b(tskey-(?:auth|api|client|webhook|scim)-[A-Za-z0-9]+-[A-Za-z0-9]{10,})\b"),
+    # age/sops encryption PRIVATE key (homelab GitOps secret-encryption). Fixed
+    # AGE-SECRET-KEY-1 prefix + uppercase bech32 body. The public age1... recipient
+    # is not secret and is deliberately not matched.
+    _rule("age-secret-key", ["age-secret-key-1"],
+          r"\b(AGE-SECRET-KEY-1[0-9A-Z]{50,70})\b"),
+    # TrueNAS API key: <id>-<64 hex/alnum>. The bare shape is generic, so gate on the
+    # provider keyword (same precision tactic as twilio/mailgun above).
+    _rule("truenas-api-key", ["truenas"],
+          r"\b(\d{1,4}-[A-Za-z0-9]{64})\b"),
+    # Grafana service-account token. Self-hosted Grafana is a homelab-monitoring staple;
+    # a leaked token exposes internal dashboards + infra topology (moat-adjacent). Fixed
+    # glsa_ prefix + 8-hex checksum tail keeps it precise.
+    _rule("grafana-service-account-token", ["glsa_"],
+          r"\b(glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8})\b"),
 ]
 
 # WARN-tier rules: detected but surfaced only by `audit`, never the blocking gate.
@@ -118,11 +142,23 @@ SKIP_PATH_GLOBS = (
 # BLOCK: a committed file of one of these names is almost always a real key/credential.
 SENSITIVE_FILE_GLOBS = (
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
-    "*.pfx", "*.p12", "*.jks", "*.keystore",
-    ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+    "*.pfx", "*.p12", "*.jks", "*.keystore", "*.ppk",
+    ".npmrc", ".pypirc", ".netrc", "_netrc", ".git-credentials",
+    ".dockercfg", ".s3cfg", ".pgpass",
     "credentials",  # e.g. .aws/credentials
     "kubeconfig", "config",  # scoped to kube dirs below
+    "shadow",  # scoped to etc/ below
     "*.ovpn", ".htpasswd",
+    # framework master secrets
+    "master.key", "prod.secret.exs",
+    # DB / FTP / SFTP client configs: saved passwords AND internal DB/host IPs (topology)
+    "filezilla.xml", "recentservers.xml", "sftp-config.json", ".ftpconfig",
+    ".remote-sync.json", "robomongo.json",
+    # exported credential stores / 2FA recovery codes
+    "logins.json", "github-recovery-codes.txt", "gitlab-recovery-codes.txt",
+    "discord_backup_codes.txt",
+    # shell history: leaks internal hostnames, paths, and commands
+    ".bash_history", ".zsh_history", ".sh_history",
 )
 # Names that would otherwise trip a BLOCK glob but are safe / public.
 SENSITIVE_FILE_ALLOW = ("*.pub", "*.example", "*.sample", "*.template", "*.dist")
@@ -131,7 +167,9 @@ SENSITIVE_FILE_ALLOW = ("*.pub", "*.example", "*.sample", "*.template", "*.dist"
 # test fixtures use those exact names; a real GCP key still BLOCKS via private-key content.
 WARN_FILE_GLOBS = ("*.pem", "*.key", "*.tfvars", "terraform.tfstate",
                    "terraform.tfstate.backup", "known_hosts", "secrets.yml",
-                   "secrets.yaml", "*.kdbx", "credentials.json", "service-account*.json")
+                   "secrets.yaml", "*.kdbx", "credentials.json", "service-account*.json",
+                   # topology disclosure (no credential itself) + templated-but-often-real
+                   "sshd_config", "dhcpd.conf", "wp-config.php", "dbeaver-data-sources.xml")
 
 # .env and variants are secret unless an explicit sample suffix.
 _ENV = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
@@ -210,6 +248,9 @@ def sensitive_file(path):
         return "env file (may contain secrets)"
     # `config`/`credentials` are only sensitive inside kube/aws/gcloud dirs.
     if base in ("config", "credentials") and not re.search(r"(^|/)\.(kube|aws|config/gcloud|docker)/", p):
+        return None
+    # `shadow` only matters as the Unix password db (a bare shadow is often a shader/asset).
+    if base == "shadow" and not re.search(r"(^|/)etc/", p):
         return None
     if base == "kubeconfig" or any(fnmatch(base, g) for g in SENSITIVE_FILE_GLOBS):
         return "sensitive filename (key/credential file)"
@@ -310,6 +351,17 @@ def shannon(data, charset):
     return entropy
 
 
+def _mostly_sequential(value):
+    """True if most adjacent chars step by <=1: alphabet walks ('abc...xyz'), repeated
+    counting runs ('01234567890123'), or long same-char stretches. A genuinely random
+    secret has almost no adjacent |delta|<=1 pairs (~3/64 per pair for base64), so the
+    0.7 threshold has a wide safety margin against suppressing a real secret."""
+    if len(value) < 8:
+        return False
+    deltas = [ord(b) - ord(a) for a, b in zip(value, value[1:])]
+    return sum(1 for dl in deltas if -1 <= dl <= 1) / len(deltas) >= 0.7
+
+
 def _is_boring(value):
     """True if a candidate value is a placeholder / stopword / template / trivial."""
     low = value.lower()
@@ -321,6 +373,8 @@ def _is_boring(value):
         return True
     if len(set(value)) <= 2:                      # all-one-or-two chars (aaaa, xyxy)
         return True
+    if _mostly_sequential(value):                 # alphabet/counting walks that break a
+        return True                               # pure arithmetic run ('abc..xyz0', '012..012')
     deltas = {ord(b) - ord(a) for a, b in zip(value, value[1:])}
     return len(value) > 3 and len(deltas) == 1    # arithmetic run (abcd, 1234)
 
