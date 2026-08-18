@@ -17,6 +17,9 @@ import sys
 
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # import sibling detectors
+import detectors  # noqa: E402
+
 LG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leakguard.py")
 
 
@@ -31,6 +34,14 @@ def ip(*octets):
 
 def home(user):
     return "/home/" + user + "/"       # a home-directory path, assembled at runtime
+
+
+def tok(prefix, char, n, suffix=""):
+    return prefix + char * n + suffix  # a provider token, assembled at runtime
+
+
+def conn(scheme, user, pw, host):
+    return scheme + "://" + user + ":" + pw + "@" + host  # a creds URL, assembled at runtime
 
 
 def run(cmd, cwd, env=None):
@@ -60,7 +71,9 @@ def repo(tmp_path):
 
 
 def stage(repo, name, content):
-    (repo / name).write_text(content)
+    p = repo / name
+    p.parent.mkdir(parents=True, exist_ok=True)  # allow nested paths like .aws/credentials
+    p.write_text(content)
     git(repo, "add", name)
 
 
@@ -168,3 +181,357 @@ def test_ci_catches_leak_in_diff(repo):
     code, out = run(["ci"], repo)
     assert code == 1
     assert lan("umbrel") in out or ip("192", "168", "1", "20") in out
+
+
+# ---------------- secrets: provider tokens ----------------
+
+def test_hook_blocks_github_pat(repo):
+    stage(repo, "cfg.yaml", f"token: {tok('ghp_', 'a', 36)}\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "github-pat" in out
+
+
+def test_hook_blocks_stripe_secret_key(repo):
+    stage(repo, "cfg.yaml", f"key: {tok('sk_live_', 'A', 30)}\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "stripe-secret-key" in out
+
+
+def test_hook_blocks_anthropic_key(repo):
+    stage(repo, "cfg.yaml", f"key: {tok('sk-ant-api03-', 'x', 93, 'AA')}\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "anthropic-api-key" in out
+
+
+def test_hook_allows_stripe_publishable_key(repo):
+    # pk_ publishable keys are public by design and must not be flagged
+    stage(repo, "cfg.yaml", f"pub: {tok('pk_live_', 'A', 30)}\n")
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_hook_allows_aws_example_doc_key(repo):
+    stage(repo, "cfg.yaml", "key: " + "AKIA" + "IOSFODNN7" + "EXAMPLE" + "\n")
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_hook_allows_placeholder_value(repo):
+    stage(repo, "cfg.yaml", 'api_key = "changeme"\npassword: secret\n')
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_hook_never_prints_raw_secret(repo):
+    raw = tok("ghp_", "a", 36)
+    stage(repo, "cfg.yaml", f"token: {raw}\n")
+    _, out = run(["hook"], repo)
+    assert raw not in out            # only the masked form may appear
+    assert raw[:4] in out            # ... but the finding is still shown
+
+
+# ---------------- secrets: connection strings ----------------
+
+def test_hook_blocks_connection_string_creds(repo):
+    stage(repo, "db.yaml", "url: " + conn("postgres", "admin", "S3cretPass99", lan("db", "internal") + ":5432") + "\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "connection-string-creds" in out
+
+
+def test_hook_allows_connection_string_placeholder_pw(repo):
+    stage(repo, "db.yaml", "url: " + conn("postgres", "user", "password", "localhost:5432") + "\n")
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+# ---------------- sensitive filenames ----------------
+
+def test_hook_blocks_private_key_filename(repo):
+    stage(repo, "deploy/id_rsa", "x\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "id_rsa" in out
+
+
+def test_hook_blocks_aws_credentials_file(repo):
+    stage(repo, ".aws/credentials", "x\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "credentials" in out
+
+
+def test_hook_blocks_dotenv_but_allows_example(repo):
+    stage(repo, ".env", "FOO=bar\n")
+    stage(repo, ".env.example", "FOO=example\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert ".env " in out or ".env\n" in out
+    assert ".env.example" not in out  # the sample file must not be flagged
+
+
+def test_hook_allows_public_key_file(repo):
+    stage(repo, "deploy/server.pub", "ssh-ed25519 AAAA...\n")
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_ci_catches_secret_in_range(repo):
+    commit(repo, "cfg.yaml", f"token: {tok('ghp_', 'b', 36)}\n", "add token")
+    code, out = run(["ci"], repo)
+    assert code == 1
+    assert "github-pat" in out
+
+
+# ---------------- detectors unit checks ----------------
+
+def test_mask_never_returns_full_value():
+    raw = tok("ghp_", "a", 36)
+    assert detectors.mask(raw) != raw
+    assert raw not in detectors.mask(raw)
+
+
+def test_scan_secret_line_keyword_prefilter_is_case_insensitive():
+    # a real value with an uppercased prefix context still resolves the token
+    hits = detectors.scan_secret_line("KEY=" + tok("ghp_", "c", 36))
+    assert any(rid == "github-pat" for rid, _ in hits)
+
+
+# ---------------- Phase 2: entropy / generic heuristics (audit-only, WARN) ----------------
+
+# a 32-char high-entropy value with no provider prefix, assembled to avoid a literal run
+RANDISH = "kJ8xQ2mN4pR7" + "vW1zL5tY9bC3" + "dF6gH0aS"
+
+
+def test_hook_does_not_block_on_entropy(repo):
+    # a bare high-entropy quoted string must NOT fail the blocking gate
+    stage(repo, "app.conf", f'blob: "{RANDISH}"\n')
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_hook_does_not_block_on_generic_keyword(repo):
+    stage(repo, "app.conf", f'api_key = "{RANDISH}"\n')
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_audit_warns_on_generic_and_entropy(repo):
+    # distinct values on distinct lines: one keyword-shaped, one bare high-entropy blob
+    other = "aZ9" + "qW4eR7tY2uI5oP8s" + "dF1gH6jK"
+    commit(repo, "app.conf", f'api_key = "{RANDISH}"\nblob: "{other}"\n', "add config")
+    code, out = run(["audit"], repo)
+    assert code == 0                       # audit never fails the process
+    assert "generic:api_key" in out
+    assert "base64-entropy" in out
+    assert RANDISH not in out and other not in out   # heuristic findings are masked too
+
+
+def test_generic_ignores_placeholder_and_benign_keys():
+    assert detectors.scan_generic_line('password = "changeme"') == []
+    assert detectors.scan_generic_line(f'public_key = "{RANDISH}"') == []
+
+
+def test_entropy_ignores_uuid_and_low_entropy():
+    assert detectors.scan_entropy_line('id: "550e8400-e29b-41d4-a716-446655440000"') == []
+    assert detectors.scan_entropy_line('word: "authorization"') == []
+
+
+def test_shannon_matches_known_values():
+    assert detectors.shannon("", detectors._B64_CHARSET) == 0.0
+    assert detectors.shannon("aaaaaaaa", detectors._B64_CHARSET) == 0.0  # single symbol -> 0
+    assert detectors.shannon(RANDISH, detectors._B64_CHARSET) > 4.5
+
+
+# ---------------- Phase 3: baseline / commit-msg / large-file / .gitignore ----------------
+
+def test_baseline_suppresses_existing_but_blocks_new(repo):
+    # a repo that already has a leak: baseline it, then a NEW leak must still block
+    commit(repo, "app.conf", f"token: {tok('ghp_', 'a', 36)}\n", "legacy leak")
+    code, _ = run(["baseline"], repo)
+    assert code == 0
+    assert (repo / ".leakguard-baseline.json").exists()
+    # a new file re-uses the accepted token AND introduces a fresh one
+    stage(repo, "other.conf", f"old: {tok('ghp_', 'a', 36)}\nnew: {tok('sk_live_', 'A', 30)}\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "stripe-secret-key" in out        # the new secret blocks
+    assert "github-pat" not in out           # the baselined one is suppressed
+    assert "suppressed" in out
+
+
+def test_baseline_file_stores_no_raw_secret(repo):
+    raw = tok("ghp_", "a", 36)
+    commit(repo, "app.conf", f"token: {raw}\n", "legacy")
+    run(["baseline"], repo)
+    assert raw not in (repo / ".leakguard-baseline.json").read_text()
+
+
+def test_commit_msg_blocks_secret_in_message(repo, tmp_path):
+    msg = tmp_path / "msg.txt"
+    msg.write_text(f"fix: rotate\n\nold key {tok('ghp_', 'a', 36)}\n")
+    code, out = run(["commit-msg", str(msg)], repo)
+    assert code == 1
+    assert "github-pat" in out
+
+
+def test_commit_msg_allows_clean_message(repo, tmp_path):
+    msg = tmp_path / "msg.txt"
+    msg.write_text("fix: a perfectly ordinary commit message\n")
+    code, _ = run(["commit-msg", str(msg)], repo)
+    assert code == 0
+
+
+def test_hook_blocks_large_file(repo):
+    (repo / "big.bin").write_bytes(b"x" * 200_000)
+    git(repo, "add", "big.bin")
+    code, out = run(["hook"], repo, env={"LEAKGUARD_MAX_KB": "100"})
+    assert code == 1
+    assert "large-file" in out
+
+
+def test_hook_allows_file_under_size_threshold(repo):
+    (repo / "small.bin").write_bytes(b"x" * 50_000)
+    git(repo, "add", "small.bin")
+    code, _ = run(["hook"], repo, env={"LEAKGUARD_MAX_KB": "100"})
+    assert code == 0
+
+
+def test_audit_reports_gitignore_gaps(repo):
+    commit(repo, "app.py", "print(1)\n", "add py")
+    code, out = run(["audit"], repo)
+    assert code == 0
+    assert "missing: .env" in out
+
+
+def test_fingerprint_is_stable_and_valueless():
+    raw = tok("ghp_", "a", 36)
+    fp = detectors.fingerprint("github-pat", raw)
+    assert fp == detectors.fingerprint("github-pat", raw) and len(fp) == 16
+    assert detectors.fingerprint("other-kind", raw) != fp   # kind is part of the hash
+
+
+# ---------------- review fixes (2026-08-18 security + quality pass) ----------------
+
+def test_hook_blocks_dotenv_in_unicode_dir(repo):
+    # git octal-escapes non-ASCII paths by default; the gate must still see them
+    stage(repo, "détox/.env", "SECRET=1\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert ".env" in out
+
+
+def test_hook_blocks_large_file_with_unicode_name(repo):
+    (repo / "big ünïcödé.bin").write_bytes(b"x" * 200_000)
+    git(repo, "add", "big ünïcödé.bin")
+    code, out = run(["hook"], repo, env={"LEAKGUARD_MAX_KB": "100"})
+    assert code == 1
+    assert "large-file" in out
+
+
+def test_baseline_does_not_launder_staged_secret(repo):
+    # baseline reads HEAD only: a merely-staged secret must NOT become accepted
+    commit(repo, "readme.txt", "clean\n", "init")
+    stage(repo, "secret.conf", f"token: {tok('ghp_', 'a', 36)}\n")
+    code, out = run(["baseline"], repo)
+    assert code == 0
+    assert "0 accepted" in out                 # nothing from HEAD
+    code, out = run(["hook"], repo)            # staged secret still blocks
+    assert code == 1 and "github-pat" in out
+
+
+def test_baseline_warns_to_rotate_committed_secrets(repo):
+    commit(repo, "secret.conf", f"token: {tok('ghp_', 'a', 36)}\n", "oops")
+    code, out = run(["baseline"], repo)
+    assert code == 0
+    assert "ROTATE" in out
+
+
+def test_hook_blocks_redis_url_without_username(repo):
+    # redis://:password@host (no username) is the canonical Redis form
+    url = "redis" + "://:" + "R3alPass99" + "@" + lan("cache", "internal") + ":6379"
+    stage(repo, "r.conf", f"url: {url}\n")
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert "connection-string-creds" in out
+
+
+def test_hook_allows_pass_placeholder_in_url(repo):
+    url = "mongodb" + "://user:" + "pass" + "@localhost:27017/db"
+    stage(repo, "docs.md", f"Example: {url}\n")
+    code, _ = run(["hook"], repo)
+    assert code == 0
+
+
+def test_jwt_is_warn_not_block(repo):
+    jwt = "eyJ" + "hbGciOiJIUzI1NiJ9" + "." + "eyJ" + "zdWIiOiIxIn0" + "." + "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"
+    commit(repo, "app.js", f'const t = "{jwt}"\n', "add jwt fixture")
+    code, _ = run(["hook"], repo)
+    assert code == 0                           # JWTs no longer block
+    code, out = run(["audit"], repo)
+    assert code == 0 and "[jwt]" in out        # ... but audit still surfaces them
+
+
+def test_hook_allows_credentials_json_fixture(repo):
+    stage(repo, "tests/fixtures/credentials.json", '{"client_secret": "mock"}\n')
+    code, _ = run(["hook"], repo)
+    assert code == 0                           # demoted to WARN tier
+    assert detectors.warn_file("tests/fixtures/credentials.json")
+
+
+def test_topology_scanned_in_lockfile(repo):
+    # lockfiles are skipped for token-shape secrets but NOT for topology leaks
+    url = "git+ssh://build@" + ip("10", "0", "9", "176") + "/internal/pkg.git"
+    stage(repo, "package-lock.json", '{"resolved": "' + url + '"}\n')
+    code, out = run(["hook"], repo)
+    assert code == 1
+    assert ip("10", "0", "9", "176") in out
+
+
+def test_ci_scans_commit_message_body(repo):
+    commit(repo, "a.txt", "hi\n", f"fix: rotate\n\nold key {tok('ghp_', 'a', 36)}")
+    code, out = run(["ci"], repo)
+    assert code == 1
+    assert "github-pat" in out
+
+
+def test_warn_file_is_separate_from_block_tier():
+    assert detectors.warn_file("server.pem") and detectors.sensitive_file("server.pem") is None
+    assert detectors.sensitive_file("deploy/id_rsa")   # block tier still fires
+
+
+def test_gitignore_gaps_respects_present_entries(repo):
+    (repo / ".gitignore").write_text(".env\n__pycache__/\n*.pyc\n")
+    commit(repo, "app.py", "print(1)\n", "add py + gitignore")
+    git(repo, "add", ".gitignore")
+    _, out = run(["audit"], repo)
+    assert "missing: .env" not in out          # present -> not flagged
+    assert "missing: *.pem" in out             # still missing -> flagged
+
+
+# ---------------- adoption: baseline --report + pre-commit manifest ----------------
+
+def test_baseline_report_lists_secrets_to_rotate(repo):
+    commit(repo, "app.conf", f"token: {tok('ghp_', 'a', 36)}\nhost: {lan('nas')}\n", "legacy")
+    run(["baseline"], repo)
+    code, out = run(["baseline", "--report"], repo)
+    assert code == 0
+    assert "SECRETS TO ROTATE" in out and "github-pat" in out
+    assert "identity / topology" in out        # topology grouped separately from secrets
+
+
+def test_baseline_report_without_baseline_file_errors(repo):
+    code, out = run(["baseline", "--report"], repo)   # no baseline written yet
+    assert code == 1
+    assert "no readable" in out
+
+
+def test_precommit_manifest_declares_both_hooks():
+    manifest = os.path.join(os.path.dirname(LG), ".pre-commit-hooks.yaml")
+    text = open(manifest).read()
+    assert "id: leakguard" in text and "id: leakguard-commit-msg" in text
+    assert "leakguard.py hook" in text and "leakguard.py commit-msg" in text
+    assert "stages: [commit-msg]" in text

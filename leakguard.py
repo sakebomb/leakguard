@@ -4,8 +4,11 @@ machine identity and internal topology into public git history.
 
 DEFENSE
   leakguard hook                 pre-commit gate: block LAN identity + internal leaks in staged diff
+  leakguard commit-msg <file>    commit-msg gate: block secrets/identity pasted into the message
   leakguard ci [--base REF]      CI gate: scan a commit range (for the GitHub Action)
-  leakguard audit                report LAN identity in this repo's config + recent history
+  leakguard baseline [--report]  accept a repo's existing leaks (block only NEW ones); --report
+                                 lists the accepted findings, secrets-to-rotate first
+  leakguard audit                report LAN identity + secrets + .gitignore gaps in this repo
   leakguard harden               set safe git config + print agent-attribution guidance
 
 RESEARCH / SELF-CHECK (PUBLIC data only)
@@ -16,8 +19,9 @@ RESEARCH / SELF-CHECK (PUBLIC data only)
 Bypass a pre-commit false positive once:  LEAKGUARD_ALLOW=1 git commit ...
 """
 import sys, os, re, json, subprocess, time, argparse
-from collections import Counter
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # resolve sibling map_render
+from collections import Counter, namedtuple
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # resolve sibling modules
+import detectors  # noqa: E402  (sibling module; requires the sys.path insert above)
 
 # ---------------- shared detection ----------------
 # leaf-anchored: matches nas.local / user@umbrel.local, NOT mail.internal.bigcorp.com
@@ -25,7 +29,8 @@ LAN_HOST = re.compile(r"\b[a-zA-Z0-9][a-zA-Z0-9-]{0,40}\.(?:local|lan|home|inter
 TSNET    = re.compile(r"\b[a-z0-9][a-z0-9-]{0,60}\.ts\.net\b", re.I)  # Tailscale MagicDNS: leaks the tailnet name
 RFC1918  = re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")
 HOMEPATH = re.compile(r"/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|[Cc]:\\Users\\[^\\\s]+")
-SECRET   = re.compile(r"AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50}|xox[baprs]-[A-Za-z0-9-]{10}|AIza[0-9A-Za-z_-]{35}|-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")
+# Secret + sensitive-file detection lives in the sibling detectors module (30+ provider
+# rules, keyword pre-filter, allowlist layer, placeholder denylist, filename globs).
 # well-known public defaults that are not real leaks (Docker/K8s/CI containers, loopback).
 # `cluster.local` is the default Kubernetes DNS suffix (boilerplate, never a personal machine).
 BENIGN   = re.compile(r"host\.docker\.internal|docker\.internal|cluster\.local|/home/(?:node|runner|vscode|appuser|coder|nonroot)/|(?<![\d.])127\.0\.0\.1(?![\d.])|172\.17\.\d{1,3}\.\d{1,3}|10\.244\.\d{1,3}\.\d{1,3}|10\.96\.\d{1,3}\.\d{1,3}|192\.168\.99\.\d{1,3}", re.I)
@@ -52,12 +57,14 @@ red = lambda s: c("31", s); ylw = lambda s: c("33", s); grn = lambda s: c("32", 
 def sh(*args):
     return subprocess.run(args, capture_output=True, text=True)
 
+# core.quotePath=false: git octal-escapes non-ASCII paths by default, which would let a
+# secret/large file under a unicode-named path slip name lists AND the +++ b/ diff header.
 def git(*args):
-    return sh("git", *args).stdout.strip()
+    return sh("git", "-c", "core.quotePath=false", *args).stdout.strip()
 
 def git_out(*args):
     """Return (ok, stdout). ok is False when git exits non-zero (e.g. an unresolved ref)."""
-    r = sh("git", *args)
+    r = sh("git", "-c", "core.quotePath=false", *args)
     return (r.returncode == 0, r.stdout)
 
 def machine_host(email):
@@ -76,21 +83,102 @@ def is_lan_identity(email):
     host = email.rsplit("@", 1)[-1] if "@" in email else ""
     return host == (os.uname().nodename if hasattr(os, "uname") else "")
 
-def scan_added_lines(diff, label, pat):
-    hits = []
-    for ln in diff.splitlines():
-        if not ln.startswith("+") or ln.startswith("+++"):
-            continue  # only real added content, never the +++ file-header line
-        if "leakguard:allow" in ln:
-            continue  # inline suppression escape hatch
-        if pat.search(BENIGN.sub("", ln)):  # ignore well-known public defaults
-            hits.append(ln)
-            if len(hits) >= 5:
-                break
-    if hits:
-        print(red(f"FOUND ({label}):"))
-        for h in hits: print("    " + h[:160])
-    return bool(hits)
+BASELINE_FILE = ".leakguard-baseline.json"
+MAX_SHOWN = 20  # cap findings printed per gate run, so a huge diff can't flood output
+# topology/identity leaks. matched value is shown in full (it is the point), not masked.
+TOPO_CHECKS = (("internal-hostname", LAN_HOST), ("tailscale-tailnet", TSNET),
+               ("private-ip", RFC1918), ("home-path", HOMEPATH))
+# A hard finding: kind, fpval (fingerprinted + baselined), display (printed), secret?, path.
+# fpval excludes the path on purpose: a secret is a secret regardless of which file holds it.
+Finding = namedtuple("Finding", "kind fpval display secret path")
+Finding.__new__.__defaults__ = (None,)  # path optional
+
+def name_only(*args):
+    """Changed file paths from a git command, empty on git error."""
+    ok, out = git_out(*args)
+    return [ln for ln in out.splitlines() if ln.strip()] if ok else []
+
+def load_baseline():
+    """Set of accepted finding fingerprints from BASELINE_FILE (empty if none)."""
+    try:
+        with open(BASELINE_FILE) as fh:
+            return set(json.load(fh).get("findings", {}))
+    except (OSError, ValueError):
+        return set()
+
+def line_findings(line, path=None, skip_secrets=False):
+    """Hard findings on one added line: topology (shown raw) + secrets (masked).
+
+    Topology always runs (even in lockfiles); secret scanning is skipped for
+    SKIP_PATH_GLOBS files (token-shape noise) via skip_secrets.
+    """
+    out = []
+    clean = BENIGN.sub("", line)  # ignore well-known public defaults
+    for label, pat in TOPO_CHECKS:
+        m = pat.search(clean)
+        if m:
+            out.append(Finding(label, m.group(0), m.group(0), False, path))
+    if not skip_secrets:
+        for rid, raw in detectors.scan_secret_line(line):
+            out.append(Finding(rid, raw, detectors.mask(raw), True, path))
+    return out
+
+def oversized(paths, size_fn):
+    """Findings for staged/committed files above LEAKGUARD_MAX_KB (default 500)."""
+    try:
+        max_kb = int(os.environ.get("LEAKGUARD_MAX_KB", "500"))
+    except ValueError:
+        max_kb = 500
+    out = []
+    for p in paths:
+        kb = size_fn(p)
+        if kb is not None and kb > max_kb:
+            out.append(Finding("large-file", p, f"{p} ({kb} KB > {max_kb} KB)", False, p))
+    return out
+
+def collect_findings(diff, files, size_fn=None):
+    """All hard findings across a diff + changed-file list (topology, secrets,
+    sensitive filenames, and oversized files when size_fn is given)."""
+    out = []
+    for path, line in detectors.iter_added(diff, skip=False):  # topology sees lockfiles too
+        out += line_findings(line, path, skip_secrets=detectors.skip_path(path))
+    for p in files:
+        reason = detectors.sensitive_file(p)
+        if reason:
+            out.append(Finding("sensitive-file", p, f"{p} - {reason}", False, p))
+    if size_fn:
+        out += oversized(files, size_fn)
+    return out
+
+def message_findings(text):
+    """Hard findings inside commit-message text (git-secrets' commit-msg vector)."""
+    out = []
+    for line in (text or "").splitlines():
+        out += [f._replace(display=f.display + "  (commit message)") for f in line_findings(line)]
+    return out
+
+def report_findings(findings, baseline):
+    """Print findings not in the baseline (masking secrets). Returns True if any block."""
+    fresh = [f for f in findings if detectors.fingerprint(f.kind, f.fpval) not in baseline]
+    if fresh:
+        print(red("FOUND:"))
+        for f in fresh[:MAX_SHOWN]:
+            loc = f"  in {f.path}" if f.path and f.path not in f.display else ""
+            print(f"    [{f.kind}] {f.display}{loc}")
+        if len(fresh) > MAX_SHOWN:
+            print(ylw(f"    ... and {len(fresh) - MAX_SHOWN} more (showing first {MAX_SHOWN})"))
+    suppressed = len(findings) - len(fresh)
+    if suppressed:
+        print(ylw(f"  ({suppressed} known finding(s) suppressed by {BASELINE_FILE})"))
+    return bool(fresh)
+
+def staged_kb(p):
+    ok, out = git_out("cat-file", "-s", f":{p}")
+    return int(out.strip()) // 1024 if ok and out.strip().isdigit() else None
+
+def head_kb(p):
+    ok, out = git_out("cat-file", "-s", f"HEAD:{p}")
+    return int(out.strip()) // 1024 if ok and out.strip().isdigit() else None
 
 # ---------------- gh (PUBLIC data, for scan/dossier) ----------------
 def gh(args, accept=None):
@@ -120,10 +208,9 @@ def cmd_hook(_):
         print("  -> run: leakguard harden   (or: git config user.email you@users.noreply.github.com)")
         fail = True
     diff = git("diff", "--cached")
-    for label, pat in (("internal hostname", LAN_HOST), ("tailscale tailnet name", TSNET),
-                       ("private/LAN IP", RFC1918), ("home directory path", HOMEPATH),
-                       ("possible secret", SECRET)):
-        if scan_added_lines(diff, label, pat): fail = True
+    files = name_only("diff", "--cached", "--name-only", "--diff-filter=ACM")
+    if report_findings(collect_findings(diff, files, size_fn=staged_kb), load_baseline()):
+        fail = True
     if fail:
         print(ylw("\nBlocked by leakguard. Fix it, or bypass once: LEAKGUARD_ALLOW=1 git commit ..."))
         return 1
@@ -145,6 +232,8 @@ def cmd_ci(a):
             return 2
         # include co-author trailers: the dominant leak vector rides there, not in %ae/%ce
         _, ids_out = git_out("log", f"--format={LOG_IDS_FMT}", rng)
+        _, msgs = git_out("log", "--format=%B", rng)
+        files = name_only("diff", "--name-only", "--diff-filter=ACM", rng)
     else:
         # push / no base: scan the tip commit only
         ok, diff = git_out("show", "HEAD")
@@ -153,16 +242,109 @@ def cmd_ci(a):
             print(red("leakguard CI ERROR: cannot read HEAD (empty repo, unborn/detached HEAD, or not a git repository)."))
             return 2
         _, ids_out = git_out("log", "-1", f"--format={LOG_IDS_FMT}")
+        _, msgs = git_out("log", "-1", "--format=%B")
+        files = name_only("diff-tree", "--no-commit-id", "--name-only", "--diff-filter=ACM", "-r", "HEAD")
     fail = False
-    for label, pat in (("internal hostname", LAN_HOST), ("tailscale tailnet name", TSNET),
-                       ("private/LAN IP", RFC1918), ("home directory path", HOMEPATH),
-                       ("possible secret", SECRET)):
-        if scan_added_lines(diff, label, pat): fail = True
+    findings = collect_findings(diff, files, size_fn=head_kb) + message_findings(msgs)
+    if report_findings(findings, load_baseline()):
+        fail = True
     for e in set((ids_out or "").splitlines()):
         if e and is_lan_identity(e):
             print(red(f"FOUND (LAN commit identity in range): {e}")); fail = True
     print((red("leakguard CI: leaks found") if fail else grn("leakguard CI: clean")))
     return 1 if fail else 0
+
+def scan_tree_findings():
+    """All hard findings across files COMMITTED in HEAD (not the staged index).
+
+    HEAD-only on purpose: baselining reads only what is already committed, so a secret
+    you just staged cannot be laundered into the accept-list in one step. Topology is
+    scanned even in lockfiles; secrets are skipped there (SKIP_PATH_GLOBS).
+    """
+    findings = []
+    for p in name_only("ls-tree", "-r", "--name-only", "HEAD"):
+        reason = detectors.sensitive_file(p)
+        if reason:
+            findings.append(Finding("sensitive-file", p, f"{p} - {reason}", False, p))
+        ok, blob = git_out("show", f"HEAD:{p}")        # committed content only
+        if not ok or "\x00" in blob[:2048]:            # skip unreadable / binary files
+            continue
+        skip_sec = detectors.skip_path(p)
+        for line in blob.splitlines():
+            findings += line_findings(line, p, skip_secrets=skip_sec)
+    return findings
+
+def baseline_report():
+    """Read-only triage of an existing baseline: what was accepted, secrets to rotate first."""
+    try:
+        findings = json.load(open(BASELINE_FILE)).get("findings", {})
+    except (OSError, ValueError):
+        print(red(f"no readable {BASELINE_FILE} - run: leakguard baseline")); return 1
+    secrets = [v for v in findings.values() if v.get("secret")]
+    topo = [v for v in findings.values() if not v.get("secret") and v.get("kind") != "sensitive-file"]
+    files = [v for v in findings.values() if v.get("kind") == "sensitive-file"]
+    print(f"== leakguard baseline report ==\n{len(findings)} accepted finding(s) in {BASELINE_FILE}\n")
+    print(red(f"SECRETS TO ROTATE ({len(secrets)}):") if secrets else grn("secrets to rotate: none"))
+    for v in secrets:
+        print(f"  [{v['kind']}] {v.get('hint', '')}" + (f"  {v['path']}" if v.get("path") else ""))
+    for title, group in (("identity / topology", topo), ("sensitive files", files)):
+        if group:
+            print(ylw(f"\n{title} ({len(group)}):"))
+            for v in group:
+                print(f"  [{v['kind']}] {v.get('hint', '')}")
+    return 0
+
+def cmd_baseline(a):
+    if a.report:
+        return baseline_report()
+    if not git_out("rev-parse", "--git-dir")[0]:
+        print(red("leakguard: not a git repository")); return 1
+    findings = scan_tree_findings()
+    data = {"version": 1, "findings": {}}
+    for f in findings:
+        fp = detectors.fingerprint(f.kind, f.fpval)   # hash only: the file never stores a raw secret
+        data["findings"][fp] = {"kind": f.kind, "path": f.path, "secret": f.secret,
+                                "hint": detectors.mask(f.fpval) if f.secret else f.display}
+    with open(BASELINE_FILE, "w") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True); fh.write("\n")
+    print(grn(f"wrote {BASELINE_FILE}: {len(data['findings'])} accepted finding(s) from HEAD."))
+    print(ylw("hook/ci now suppress these; NEW leaks still block. Commit the baseline to share it."))
+    secret_ct = sum(1 for f in findings if f.secret)
+    if secret_ct:
+        print(red(f"\nWARNING: {secret_ct} of these are live SECRET(s) already committed."))
+        print(red("Baselining only silences the alert - it does NOT make them safe. ROTATE them now."))
+    return 0
+
+def cmd_commit_msg(a):
+    if os.environ.get("LEAKGUARD_ALLOW") == "1":
+        return 0
+    try:
+        text = open(a.file, encoding="utf-8", errors="replace").read()
+    except OSError:
+        # deliberately fail OPEN here (unlike hook/ci): a transient FS error reading the
+        # temp message file must not block every commit. git always supplies a real path.
+        return 0
+    body = "\n".join(ln for ln in text.splitlines() if not ln.startswith("#"))
+    if report_findings(message_findings(body), load_baseline()):
+        print(ylw("\nSecret/identity leak in the commit message. Bypass once: LEAKGUARD_ALLOW=1 git commit ..."))
+        return 1
+    return 0
+
+def gitignore_gaps(tracked):
+    """Standard .gitignore entries missing for the project types present in `tracked`."""
+    try:
+        present = set(open(".gitignore").read().split())
+    except OSError:
+        present = set()
+    bases = {os.path.basename(t) for t in tracked}
+    want = [".env", "*.pem", "*.key"]
+    if any(t.endswith(".py") for t in tracked) or {"requirements.txt", "pyproject.toml"} & bases:
+        want += ["__pycache__/", "*.pyc"]
+    if "package.json" in bases:
+        want += ["node_modules/"]
+    if any(t.endswith(".tf") for t in tracked):
+        want += [".terraform/", "*.tfstate", "*.tfvars"]
+    return [w for w in dict.fromkeys(want) if w not in present]
 
 def cmd_audit(_):
     print("== leakguard audit ==")
@@ -178,6 +360,29 @@ def cmd_audit(_):
     hosts = sorted(set(m.group(0).lower() for m in LAN_HOST.finditer(diff)))[:20]
     print("\ninternal hosts in recent diffs:")
     print("\n".join("  ! " + x for x in hosts) if hosts else grn("  none found"))
+    print("\nsecrets in recent diffs:")
+    secrets = detectors.scan_diff_secrets(diff)
+    if secrets:
+        for rid, raw, path in secrets:
+            print(red(f"  ! [{rid}] {detectors.mask(raw)}" + (f"  ({path})" if path else "")))
+    else:
+        print(grn("  none found"))
+    print("\npossible secrets (entropy / keyword heuristics - review, not blocking):")
+    heur = detectors.scan_diff_heuristic(diff)
+    if heur:
+        for kind, masked, path in heur:
+            print(ylw(f"  ~ [{kind}] {masked}" + (f"  ({path})" if path else "")))
+    else:
+        print(grn("  none found"))
+    print("\nsensitive files (recent + tracked):")
+    tracked = name_only("ls-files")
+    files = set(name_only("log", "-50", "--name-only", "--format=")) | set(tracked)
+    flagged = sorted({f"{p} - {r}" for p in files
+                      for r in (detectors.sensitive_file(p) or detectors.warn_file(p),) if r})
+    print("\n".join("  ! " + x for x in flagged) if flagged else grn("  none found"))
+    print("\n.gitignore gaps (standard entries missing for this project):")
+    gaps = gitignore_gaps(tracked)
+    print("\n".join("  ! missing: " + g for g in gaps) if gaps else grn("  none - key patterns covered"))
     return 0
 
 def cmd_harden(_):
@@ -198,11 +403,15 @@ Disable AI-agent attribution trailers (they leak agent + model, sometimes your L
   VS Code      settings.json:            "git.addAICoAuthor": "off"
   Aider        flags:                    --no-attribute-author --no-attribute-committer
 
-Install the pre-commit hook globally:
+Install the hooks globally (pre-commit scans the diff; commit-msg scans the message):
   mkdir -p ~/.git-hooks
   printf '#!/usr/bin/env sh\\nexec leakguard hook\\n' > ~/.git-hooks/pre-commit
-  chmod +x ~/.git-hooks/pre-commit
-  git config --global core.hooksPath ~/.git-hooks""")
+  printf '#!/usr/bin/env sh\\nexec leakguard commit-msg "$1"\\n' > ~/.git-hooks/commit-msg
+  chmod +x ~/.git-hooks/pre-commit ~/.git-hooks/commit-msg
+  git config --global core.hooksPath ~/.git-hooks
+
+Adopt leakguard on a repo that already has leaks (accept them, block only NEW ones):
+  leakguard baseline        # writes .leakguard-baseline.json (hashes only, no raw secrets)""")
     return 0
 
 # ---------------- RESEARCH subcommands (PUBLIC data) ----------------
@@ -311,6 +520,9 @@ def build_parser():
     ci = sub.add_parser("ci"); ci.add_argument("--base", default=None); ci.set_defaults(fn=cmd_ci)
     sub.add_parser("audit").set_defaults(fn=cmd_audit)
     sub.add_parser("harden").set_defaults(fn=cmd_harden)
+    bl = sub.add_parser("baseline"); bl.add_argument("--report", action="store_true")
+    bl.set_defaults(fn=cmd_baseline)
+    cm = sub.add_parser("commit-msg"); cm.add_argument("file"); cm.set_defaults(fn=cmd_commit_msg)
     sc = sub.add_parser("scan"); sc.add_argument("user"); sc.add_argument("--deep", action="store_true")
     sc.add_argument("--json", action="store_true"); sc.add_argument("--pages", type=int, default=3); sc.set_defaults(fn=cmd_scan)
     do = sub.add_parser("dossier"); do.add_argument("user"); do.add_argument("--pages", type=int, default=2); do.set_defaults(fn=cmd_dossier)
